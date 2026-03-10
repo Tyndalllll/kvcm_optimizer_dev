@@ -1,236 +1,426 @@
-# 混合 Workload 下的 KV Cache 分层优化：问题定义与推进路线
+# 混合 AI Workload 的分层 KV Cache 优化执行策略
 
-## 1. 背景
+## 1. 总体目标
 
-在大部分模型公司的线上产品形态中，面向用户的 AI App 往往是一个 **Super App**，而非单一应用。
-在同一产品入口下，用户会发起多类请求（如 Chat、Summary、Writing、QA、RAG、Agent、Code）。
+在混合 AI workload 场景下，构建一套从 trace 到存储策略的闭环系统，使系统能够：
 
-虽然这些请求在产品层属于不同功能，但在推理系统层通常会进入同一模型服务集群，最终汇入同一个整体 workload。
+1. 从混合 trace 中识别不同访问模式。
+2. 将访问模式映射为稳定缓存行为的 workload 类别。
+3. 对不同 workload 建立缓存收益模型。
+4. 基于收益与成本决定 KV 对象进入哪一层存储。
+5. 同时支持离线分析与在线决策。
 
-这带来关键挑战：
+一句话概括：
 
-> 不同访问模式被混合后，系统难以识别它们在 KV Cache 上的真实行为差异。
-
-从缓存系统视角，不同请求类型常见差异包括：
-
-- 前缀复用模式
-- 请求生命周期
-- 热点持续时间
-- 上下文长度
-- 命中收益
-- 适配存储层级
-
-因此，若将所有请求统一看作单一 workload，缓存与分层存储策略很难做到全局最优。
+> 先识别 workload，再评估 workload 的缓存价值，最后做分层存储决策。
 
 ---
 
-## 2. 当前工程基础（已具备能力）
+## 2. 总体框架（四层）
 
-目前 optimizer 模块已完成核心基础能力：
+### Layer 1：Trace 表征层
 
-1. **Trace 采集与分析能力**：可获取并回放请求 trace（时间戳/输入/输出）。
-2. **前缀树建模能力**：可基于前缀树分析 workload 的前缀共享关系。
-3. **单层容量分析能力**：可评估不同容量下命中率并给出单层配置建议。
+将原始 trace 转换为可计算样本。
 
-这意味着系统已经具备：
+**输入**：
+- 请求时间戳
+- 输入 / 输出
+- prefix trie 匹配关系
+- session 信息（如果有）
+- token 长度、prefix 长度、输出长度
 
-- workload 基础建模
-- 命中率评估
-- 容量收益分析
+**输出**：
+- request-level 样本
+- prefix/node-level 样本
+- 时间窗口级统计特征
 
----
+### Layer 2：Workload 识别层
 
-## 3. 当前核心问题（从“单层优化”转向“识别+分层”）
+从混合流量中识别行为稳定的 workload 类型。
 
-在现阶段，核心难点已转移到两个前后依赖的问题：
+**目标**：
+- 找出行为相似的请求或 prefix 对象
+- 形成 workload taxonomy
+- 提供可解释标签
 
-1. **如何识别 workload**
-   - 在混合流量中识别具有稳定缓存行为模式的子 workload。
-2. **如何进行分层存储**
-   - 基于 workload 行为差异，进行分层策略设计与资源分配。
+**输出**：
+- workload classes
+- 每个请求 / prefix 的类别归属
+- 每类 workload 的行为画像
 
-两者并非并列关系：
+### Layer 3：Value / Cost 建模层
 
-> workload 识别是分层存储的前提。
+对 workload 或 prefix 对象计算缓存价值和层级收益。
 
-如果无法先识别 workload，就难以执行针对性的分层优化。
+**目标**：
+- 估计未来命中概率
+- 估计命中收益
+- 估计对象大小
+- 估计迁移成本
+- 形成分层放置分数
 
----
+**输出**：
+- value score
+- tier score
+- eviction / promotion / demotion priority
 
-## 4. 问题定义（缓存系统视角）
+### Layer 4：分层存储决策层
 
-### 4.1 表面问题
+基于 workload 类型与价值分数执行实际策略。
 
-这是一个流量分类问题：
+**目标**：
+- 选择 L1 / L2 / L3 / 不缓存
+- 设置 TTL
+- 设置晋升 / 降级规则
+- 动态适应 workload 变化
 
-- 混合流量来自多种应用模式
-- 不同模式具备不同访问特征
-- 需要将其区分
-
-### 4.2 本质问题
-
-从缓存系统视角，本质是：
-
-> 面向 KV Cache 行为的 workload 分解问题。
-
-我们要区分的不是业务名字本身，而是缓存行为相似性：
-
-- 前缀复用模式是否相似
-- 时间局部性是否相似
-- 生命周期是否相似
-- 单位容量收益是否相似
-- 存储策略适配性是否相似
-
-### 4.3 统一问题陈述
-
-给定由多种 AI 应用模式混合形成的大规模 trace 流，
-基于其前缀复用结构、时间局部性、生命周期与存储收益特征，
-将其分解为若干具有稳定缓存行为的 workload 类型，
-并进一步为不同 workload 设计差异化分层存储策略。
-
----
-
-## 5. 为什么必须先做 workload 识别
-
-混合流量中，不同模式天然对应不同缓存需求。示例：
-
-- **模板复用型**（summary/writing/部分 QA）：固定模板前缀 + 少量变量输入，通常高复用。
-- **会话递增型**（chat）：session 内复用高，跨 session 复用未必高。
-- **检索拼接型**（RAG）：前缀中插入检索片段，结构稳定性较弱。
-- **阶段轨迹型**（agent/tool）：长轨迹、多阶段演化，访问路径复杂。
-- **长上下文收益型**（code 等）：对象大、单次命中收益高，但复用稳定性未必强。
-
-若统一使用同一策略，常见后果：
-
-- 高价值 workload 被低估
-- 低价值 workload 过度占用高层资源
-- 分层收益被“平均化”
-- 容量与淘汰策略缺乏针对性
-
-结论：
-
-> workload 识别不是附属步骤，而是分层方案起点。
+**输出**：
+- 存储层级
+- 生命周期策略
+- 迁移策略
 
 ---
 
-## 6. 两类方法：Role-based 与 Cost-based
+## 3. 方案核心思想：两阶段融合
 
-## 6.1 Role-based（按“角色”识别）
+该方案不是“只做分类”，而是一个两阶段系统：
 
-回答问题：**这是什么 workload？**
+### 第一阶段：Role-based workload decomposition
 
-可按业务角色（Chat / Summary / RAG / Agent / Code）或缓存行为角色（模板复用型、会话递增型等）分类。
+回答：
 
-优点：
+> 这个对象属于哪种访问模式？
 
-- 可解释性强
-- 适合 profiling 与系统汇报
-- 易与人工经验结合
+作用：建立流量结构理解与可解释性。
 
-局限：
+### 第二阶段：Cost-based tier placement
 
-- 角色不必然直接映射最优存储策略
-- 同一角色内部可能差异较大
+回答：
 
-## 6.2 Cost-based（按“成本/收益”识别）
+> 这个对象值不值得放高层？应该保留多久？
 
-回答问题：**该 workload 怎么存最划算？**
+作用：执行真实的资源优化与在线控制。
 
-直接围绕决策变量：
+因此不是二选一，而是融合：
 
-- 命中节省计算成本
-- KV 对象大小
-- 重访时延
-- 高层驻留机会成本
-- 晋升/降级迁移成本
-
-优点：
-
-- 直接服务分层决策
-- 不依赖业务标签
-- 更适合动态优化
-
-局限：
-
-- 可解释性偏弱
-- 对流量结构理解能力较弱
-
-## 6.3 二者关系
-
-二者互补而非互斥：
-
-- Role-based：做 workload 分解与结构理解
-- Cost-based：做分层存储决策
-
-推荐路径：
-
-> 先 Role-based 分解，再 Cost-based 优化。
+- Role-based 负责识别
+- Cost-based 负责决策
 
 ---
 
-## 7. 目标收敛与系统闭环
+## 4. Workload 识别对象：双粒度建模
 
-### 7.1 第一层：Workload 识别
+## 4.1 Request-level 粒度
 
-把混合 workload 拆为若干稳定子 workload，回答“有哪些主要访问模式”。
+每个请求一条样本。用于：
+- 识别总体流量模式
+- 做 workload profiling
+- 分析时间分布
 
-### 7.2 第二层：Workload 建模
+优点：直观、易与业务流量对齐。
 
-把“模式”转化为“可计算对象”，重点刻画：
+局限：与缓存对象有一层距离。
 
-- 前缀共享结构
-- 时间重访间隔
-- 热点持续时间
-- KV 对象大小分布
-- 单位容量收益
-- 生命周期特征
+## 4.2 Prefix / Node-level 粒度
 
-### 7.3 第三层：分层存储决策
+将 Trie 热点 prefix 节点或子树作为样本。用于：
+- 判断哪些 prefix 适合长期保留
+- 识别高价值复用子树
+- 映射分层存储对象
 
-围绕对象级策略做决策：
+优点：贴近 KV cache 实体，易映射分层策略。
 
-- 驻留高层 / 下沉低层 / 短暂缓存
-- 晋升时机 / 降级时机 / 淘汰时机
+局限：可解释性略弱，需要附加画像。
 
-### 7.4 最终目标
+## 推荐方式
 
-在容量约束下最大化整体缓存收益，并兼顾可解释性与可运营性。
-
----
-
-## 8. 推荐总体方向
-
-1. **先建立面向缓存行为的 workload taxonomy**
-   - 模板复用型
-   - 会话递增型
-   - 检索拼接型
-   - 阶段轨迹型
-   - 长尾低复用型
-2. **在 taxonomy 上构建收益模型**
-   - 命中概率、生命周期、节省成本、对象大小、迁移成本、层级适配性
-3. **形成 role-aware cost-based 系统**
-   - 用 role 理解流量结构，用 cost 驱动最终决策。
+采用双粒度：
+- request-level：用于 role 识别和流量画像
+- prefix/node-level：用于价值评估和层级决策
 
 ---
 
-## 9. 近期优先事项（落地清单）
+## 5. Workload 识别特征框架（五类）
 
-1. **统一识别目标口径**
-   - 分类对象是缓存行为模式，不是业务名称本身。
-2. **设计 workload 特征体系**
-   - 前缀结构、时间局部性、生命周期、KV 大小与收益、session 特征。
-3. **建立初版 workload taxonomy**
-   - 先粗分，优先可稳定复现且可指导策略的类别。
-4. **做收益对比验证**
-   - 对比“区分 vs 不区分 workload”在命中率、容量收益、迁移成本上的差异。
-5. **逐步走向在线决策**
-   - 请求到来时识别 workload，估计对象价值，选择层级并动态调整策略。
+## 5.1 前缀结构特征
+
+核心特征（依赖现有 Trie 能力）：
+- matched_prefix_len
+- prefix_share_ratio
+- prefix_depth
+- fanout
+- subtree_access_count
+- prefix_popularity
+- prefix_stability
+- branch_entropy
+
+主要区分：
+- 模板复用型
+- 会话递增型
+- 检索拼接型
+- 长尾随机型
+
+## 5.2 时间局部性特征
+
+用于回答“多久会再次命中”：
+- inter_arrival_time
+- reuse_distance_time
+- reuse_distance_requests
+- burstiness
+- hot_survival_time
+- last_access_gap
+- periodicity_score
+
+主要区分：
+- 短 burst 热点
+- 稳定长寿命热点
+- 周期性回访对象
+- 长尾低重访对象
+
+## 5.3 生命周期特征
+
+用于描述活跃周期与衰减过程：
+- birth_time
+- last_hit_time
+- active_duration
+- hit_count_before_decay
+- ttl_like_duration
+- session_boundness
+
+主要区分：
+- session 内有效对象
+- 跨 session 长期复用对象
+- 短命热点对象
+
+## 5.4 容量与收益特征
+
+Cost-based 决策基础：
+- input_tokens
+- prefix_tokens
+- output_tokens
+- estimated_kv_size
+- estimated_prefill_saving
+- hit_probability
+- saving_per_byte
+- future_value_score
+
+主要区分：
+- 小对象高频命中
+- 大对象中频命中
+- 低价值长尾对象
+
+## 5.5 会话与结构特征（增强可解释）
+
+- session_id
+- turn_index
+- num_turns_in_session
+- cross_session_reuse_ratio
+- template_indicator
+- retrieval_injection_indicator
+- tool_call_indicator
+- code_block_indicator
+
+增强对 chat / RAG / agent / code 的可解释性。
 
 ---
 
-## 10. 一句话总结
+## 6. 初版 Workload Taxonomy（建议 5 类）
 
-我们需要把“混合流量上的统一缓存”演进为：
+## Class A：模板复用型
 
-> 面向 workload 类型与收益特征的分层智能 KV Cache 系统。
+**特征**：长共享前缀、低 fanout、命中稳定、生命周期较长。
+**来源**：summary / writing / 模板化 QA。
+**缓存含义**：适合中高层长期保留。
+
+## Class B：会话递增型
+
+**特征**：session 内前缀持续增长，session 内高复用，session 外低复用。
+**来源**：chat / 多轮助手。
+**缓存含义**：适合 session-local 高层，session 结束后快速降级或清理。
+
+## Class C：检索拼接型
+
+**特征**：固定指令前缀 + 检索片段插入，结构不稳定，命中碎片化。
+**来源**：RAG / retrieval QA。
+**缓存含义**：固定骨架值得缓存，检索插入段需细粒度策略。
+
+## Class D：轨迹 / Agent 型
+
+**特征**：请求链长、阶段性复用、中间状态多、生命周期复杂。
+**来源**：agent / tool use / workflow orchestration。
+**缓存含义**：阶段性短保留，更依赖时间局部性信号。
+
+## Class E：长尾低复用型
+
+**特征**：共享前缀短、命中概率低、生命周期不可预测、单位容量收益低。
+**来源**：随机一次性请求。
+**缓存含义**：不缓存或短 TTL 缓存。
+
+---
+
+## 7. Workload 识别方法（两步走）
+
+## 7.1 第一步：规则 / 统计粗分类
+
+优先基于稳定指标快速落地：
+- prefix_share_ratio
+- fanout
+- session_boundness
+- reuse_distance
+- saving_per_byte
+
+示例规则：
+- 高共享前缀 + 低 fanout → 模板复用型
+- 高 session 绑定 + 前缀持续增长 → 会话递增型
+- 中段变化高 + retrieval 痕迹明显 → 检索拼接型
+- 长链路 + 阶段性热点 → Agent 型
+- 低命中低收益 → 长尾型
+
+目标：快速建立初版 taxonomy，便于人工校验并打通链路。
+
+## 7.2 第二步：聚类 / 学习细分
+
+在粗分类基础上细分：
+- 方法 A：K-means / GMM（特征规整、簇数可控）
+- 方法 B：HDBSCAN（长尾多、簇数未知、自动噪声识别）
+- 方法 C：图聚类 / 社区发现（利用 Trie 共享图）
+
+推荐优先顺序：
+1. 规则粗分
+2. HDBSCAN 细分
+3. 必要时引入图方法
+
+---
+
+## 8. Value / Cost 模型（从识别到分层）
+
+## 8.1 单对象价值
+
+对 prefix/node 定义：
+
+\[
+Value = \frac{P(\text{future hit}) \times Saving(\text{hit})}{Size}
+\]
+
+即：未来命中概率 × 命中收益 ÷ 占用空间。
+
+## 8.2 加入迁移与存储成本
+
+分层评分：
+
+\[
+TierScore = ExpectedSaving - MigrationCost - StorageCost
+\]
+
+对 L1/L2/L3 分别估计：
+- L1：收益高但容量贵
+- L2：收益次高、成本中等
+- L3：收益较低、容量最便宜、可长留
+
+## 8.3 Role Prior 与 CostValue 融合
+
+最终评分：
+
+\[
+FinalScore = \alpha \cdot RolePrior + \beta \cdot CostValue
+\]
+
+- RolePrior：类别先验偏好（如模板型偏长期）
+- CostValue：当前对象实时收益价值
+
+示例：
+- 模板复用型：偏中高层长期保留
+- 会话递增型：偏短期高层
+- 长尾型：偏不缓存或低层短保留
+
+---
+
+## 9. 分层存储决策框架
+
+## 9.1 层级抽象
+
+- L1：最快、最贵、容量最小
+- L2：中速、中成本
+- L3 / cold / spill：最慢、最便宜、容量最大
+- 或不缓存
+
+## 9.2 决策动作
+
+系统支持四类动作：
+- admit（是否准入）
+- promote（是否晋升）
+- demote（是否降级）
+- evict（是否淘汰）
+
+## 9.3 分类型策略示意
+
+- 模板复用型：admission 更宽松，L2 长驻，高频晋升 L1
+- 会话递增型：优先 L1，session 结束后快速降级/淘汰
+- 检索拼接型：骨架重点缓存，拼接段谨慎缓存
+- Agent 型：阶段热点短保留，promotion 条件更严格
+- 长尾型：严格 admission、低 TTL、快速淘汰
+
+---
+
+## 10. 离线到在线实施路线
+
+## Phase 1：离线 Profiling
+
+**目标**：看清混合 workload 结构，验证 taxonomy。
+**工作**：特征分布统计、粗分类、类别命中率/生命周期/收益对比。
+**产出**：workload 分析报告 + 初版 taxonomy。
+
+## Phase 2：离线策略仿真
+
+**目标**：验证 workload-aware 分层优于统一策略。
+**对比**：
+- baseline 1：单层统一缓存
+- baseline 2：分层但不区分 workload
+- method：role-aware + cost-based 分层
+
+**指标**：
+- 总命中率
+- 分层命中率
+- 平均 latency / P99 latency
+- migration 次数
+- eviction 次数
+- saving per byte
+
+**产出**：workload-aware 策略收益评估。
+
+## Phase 3：在线轻量识别
+
+**目标**：请求到来时快速给出 workload 类型和 tier 推荐。
+**输入**：prefix 匹配、近期频次、上次访问时间、session 特征、容量压力。
+**输出**：workload class、tier recommendation、TTL/priority。
+
+## Phase 4：在线自适应更新
+
+**目标**：应对 workload drift。
+**能力**：周期性重估分布、调整 role prior、更新阈值、识别流量切换点。
+
+---
+
+## 11. 三个关键研究问题
+
+1. **按请求分，还是按 prefix 分？**
+   - 建议：请求用于画像，prefix/node 用于决策。
+2. **taxonomy 按业务名，还是按缓存行为？**
+   - 建议：按缓存行为定义，以服务存储优化目标。
+3. **最终靠 role 还是 cost？**
+   - 建议：role 负责识别与解释，cost 负责优化与控制；采用 role-aware cost-based。
+
+---
+
+## 12. 收敛结论
+
+针对混合 AI workload，不应直接在统一流量上设计分层缓存。
+应先基于前缀结构、时间局部性、生命周期和收益特征，将流量分解为稳定 workload 类型，再结合对象级收益模型完成分层决策。
+
+落地顺序：
+
+1. workload decomposition
+2. workload taxonomy
+3. value/cost modeling
+4. tier placement
 
