@@ -2,6 +2,13 @@
 
 ## 概述
 
+## 文档导航
+
+- 优化器使用与能力总览：`kv_cache_manager/optimizer/README.md`
+- 分析脚本说明：`kv_cache_manager/optimizer/analysis/script/README.md`
+- 混合 workload 分层优化问题定义：`kv_cache_manager/optimizer/docs/mixed_workload_hierarchical_strategy.md`
+
+
 KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回放 trace 数据来模拟缓存读写操作，评估不同驱逐策略和配置对缓存命中率的影响，并为 KVCacheManager 主程序提供参数优化能力。
 
 核心功能包括：
@@ -374,6 +381,13 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 ## Trace 输入格式
 
 ### 概述
+
+## 文档导航
+
+- 优化器使用与能力总览：`kv_cache_manager/optimizer/README.md`
+- 分析脚本说明：`kv_cache_manager/optimizer/analysis/script/README.md`
+- 混合 workload 分层优化问题定义：`kv_cache_manager/optimizer/docs/mixed_workload_hierarchical_strategy.md`
+
 
 Optimizer 只接受标准格式的trace文件。使用独立的Python工具将各种trace格式转换为标准格式。
 

@@ -286,3 +286,17 @@ script/
     ├── csv_loader.py             # CSV 加载 + 容量列表
     └── plot_utils.py             # 绘图风格 + Pareto 绘图
 ```
+---
+
+## 5. 面向混合 workload 的后续演进
+
+当前脚本集已覆盖单次仿真、容量 tradeoff、树导出与 lifecycle 分析。
+在 Super App 混合流量场景下，建议将脚本输出继续用于“workload 识别 → 分层策略决策”闭环，详见：
+
+- `kv_cache_manager/optimizer/docs/mixed_workload_hierarchical_strategy.md`
+
+该文档定义了：
+
+- 面向 KV Cache 行为的 workload 分解问题
+- Role-based 与 Cost-based 的职责分工
+- 从离线分析到在线决策的落地路线
